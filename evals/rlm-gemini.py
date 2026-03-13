@@ -1,29 +1,34 @@
 import ast
 import os
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 from dotenv import load_dotenv
 from rlm import RLM
 
 load_dotenv()
 
-MAX_SAMPLES = 1
-BATCH_SIZE = 3  # RLM calls are heavier; keep concurrency low
-MODEL = "google/gemini-3-flash-preview"
+MAX_SAMPLES = None
+MODEL = "openai/gpt-5-mini"
 
 TASK_PROMPT = """\
-You are given the full text of a research paper, split into paragraphs separated by "\\n\\n", \
-and a question about it.
+You are given the full text of a research paper and a question about it.
 
-Your task: identify which paragraphs contain evidence relevant to answering QUESTION.
+Your task: find all substrings from TEXT that contain evidence relevant to answering QUESTION.
 
-Use Python to split TEXT into paragraphs and collect the relevant ones into a list. \
-Each element of the list must be an exact paragraph from TEXT (no paraphrasing or modifications).
+Instructions:
+- Use keyword/string search in Python to locate candidate excerpts efficiently. \
+Think about what words or phrases would appear near the answer and search for them.
+- NEVER pass the full TEXT or large chunks to llm_query — it is too slow and expensive. \
+Any string passed to llm_query must be under 4000 characters.
+- Only call llm_query on short candidate excerpts to judge their relevance.
+- Returned substrings must be exact character-for-character slices of TEXT (use TEXT[start:end]). \
+Do NOT paraphrase or modify them.
+- Each substring should be full logical sentences / a paragraph-sized excerpt — not just a few \
+words.
 
-When you have finished, store the list of relevant paragraphs in a variable named `answer` and \
+When you have finished, store the list of relevant substrings in a variable named `answer` and \
 call FINAL_VAR(answer). Example:
 ```python
-answer = ["full paragraph text 1", "full paragraph text 2"]
+answer = ["exact slice 1", "exact slice 2"]
 FINAL_VAR(answer)
 ```
 
@@ -34,7 +39,7 @@ TEXT:
 """
 
 
-def retrieve_relevant_substrings(question: str, text: str) -> list[str]:
+def retrieve_relevant_substrings(question: str, text: str) -> tuple[list[str], dict]:
     rlm = RLM(
         backend="openrouter",
         backend_kwargs={
@@ -51,21 +56,28 @@ def retrieve_relevant_substrings(question: str, text: str) -> list[str]:
     response = result.response or ""
 
     u = result.usage_summary
-    cost_str = f"${u.total_cost:.6f}" if u.total_cost is not None else "n/a"
+    stats = {
+        "time": result.execution_time,
+        "input_tokens": u.total_input_tokens or 0,
+        "output_tokens": u.total_output_tokens or 0,
+        "cost": u.total_cost or 0.0,
+    }
+    cost_str = f"${stats['cost']:.6f}"
     print(
-        f"RLM STATS | time={result.execution_time:.2f}s "
-        f"in={u.total_input_tokens:,} out={u.total_output_tokens:,} cost={cost_str}"
+        f"RLM STATS | time={stats['time']:.2f}s "
+        f"in={stats['input_tokens']:,} out={stats['output_tokens']:,} cost={cost_str}",
+        flush=True,
     )
-    print("RLM RESPONSE", response)
+    print("RLM RESPONSE", response, flush=True)
 
     try:
         substrings = ast.literal_eval(response)
         if isinstance(substrings, list):
-            return [s for s in substrings if isinstance(s, str)]
+            return [s for s in substrings if isinstance(s, str)], stats
     except (ValueError, SyntaxError):
         pass
 
-    return []
+    return [], stats
 
 
 def merge_intervals(intervals: list[tuple[int, int]]) -> list[tuple[int, int]]:
@@ -116,7 +128,7 @@ def process_sample(i: int, sample: dict, total: int) -> dict | None:
     evidence = sample["evidence"]
 
     if not paragraphs or not evidence:
-        print(f"[{i+1}/{total}] Skipping — no paragraphs or evidence")
+        print(f"[{i+1}/{total}] Skipping — no paragraphs or evidence", flush=True)
         return None
 
     text = "\n\n".join(paragraphs)
@@ -126,33 +138,34 @@ def process_sample(i: int, sample: dict, total: int) -> dict | None:
         ev = ev.strip()
         idx = text.find(ev)
         if idx == -1:
-            print(f"[{i+1}/{total}] Warning — evidence not found in text: {ev[:60]}")
+            print(f"[{i+1}/{total}] Warning — evidence not found in text: {ev[:60]}", flush=True)
         else:
             evidence_intervals.append((idx, idx + len(ev)))
 
     if not evidence_intervals:
-        print(f"[{i+1}/{total}] Skipping — no evidence located in text")
+        print(f"[{i+1}/{total}] Skipping — no evidence located in text", flush=True)
         return None
 
     try:
-        substrings = retrieve_relevant_substrings(question, text)
+        substrings, rlm_stats = retrieve_relevant_substrings(question, text)
         retrieved_intervals = []
         for s in substrings:
             idx = text.find(s)
             if idx != -1:
                 retrieved_intervals.append((idx, idx + len(s)))
-    except Exception as e:
+    except BaseException as e:
         import traceback
-        print(f"[{i+1}/{total}] Skipping — retrieval failed ({e})")
+        print(f"[{i+1}/{total}] Skipping — retrieval failed ({e})", flush=True)
         traceback.print_exc()
         return None
 
     metrics = compute_metrics(retrieved_intervals, evidence_intervals)
     print(
         f"[{i+1}/{total}] P={metrics['precision']:.3f} R={metrics['recall']:.3f} "
-        f"F1={metrics['f1']:.3f} | retrieved={len(retrieved_intervals)} | {question[:60]}"
+        f"F1={metrics['f1']:.3f} | retrieved={len(retrieved_intervals)} | {question[:60]}",
+        flush=True,
     )
-    return metrics
+    return {**metrics, "rlm_stats": rlm_stats}
 
 
 def main():
@@ -162,23 +175,23 @@ def main():
     samples = data if MAX_SAMPLES is None else data[:MAX_SAMPLES]
 
     total_precision = total_recall = total_f1 = 0.0
+    total_time = total_input = total_output = total_cost = 0.0
     evaluated = 0
 
-    with ThreadPoolExecutor(max_workers=BATCH_SIZE) as executor:
-        futures = {
-            executor.submit(process_sample, i, sample, len(samples)): i
-            for i, sample in enumerate(samples)
-        }
+    for i, sample in enumerate(samples):
+        result = process_sample(i, sample, len(samples))
+        if result is None:
+            continue
 
-        for future in as_completed(futures):
-            metrics = future.result()
-            if metrics is None:
-                continue
-
-            total_precision += metrics["precision"]
-            total_recall += metrics["recall"]
-            total_f1 += metrics["f1"]
-            evaluated += 1
+        total_precision += result["precision"]
+        total_recall += result["recall"]
+        total_f1 += result["f1"]
+        s = result["rlm_stats"]
+        total_time += s["time"]
+        total_input += s["input_tokens"]
+        total_output += s["output_tokens"]
+        total_cost += s["cost"]
+        evaluated += 1
 
     print(f"\nAverage over {evaluated} samples:")
     if evaluated == 0:
@@ -187,6 +200,12 @@ def main():
     print(f"  Precision : {total_precision / evaluated:.4f}")
     print(f"  Recall    : {total_recall / evaluated:.4f}")
     print(f"  F1        : {total_f1 / evaluated:.4f}")
+    print(f"\nRLM stats (avg per sample):")
+    print(f"  Time      : {total_time / evaluated:.2f}s")
+    print(f"  Input tok : {total_input / evaluated:,.0f}")
+    print(f"  Output tok: {total_output / evaluated:,.0f}")
+    print(f"  Cost      : ${total_cost / evaluated:.6f}")
+    print(f"  Total cost: ${total_cost:.4f}")
 
 
 if __name__ == "__main__":
