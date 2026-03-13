@@ -1,81 +1,71 @@
-import json
+import ast
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from openai import OpenAI
+import json
 from dotenv import load_dotenv
+from rlm import RLM
 
 load_dotenv()
 
-MAX_SAMPLES = None
-BATCH_SIZE = 10
-CHUNK_SIZE = 512
-CHUNK_OVERLAP = 128
-MODEL = "anthropic/claude-opus-4.6"
+MAX_SAMPLES = 1
+BATCH_SIZE = 3  # RLM calls are heavier; keep concurrency low
+MODEL = "google/gemini-3-flash-preview"
 
-client = OpenAI(
-    base_url="https://openrouter.ai/api/v1",
-    api_key=os.getenv("OPENROUTER_API_KEY"),
-)
+TASK_PROMPT = """\
+You are given the full text of a research paper, split into paragraphs separated by "\\n\\n", \
+and a question about it.
 
-SYSTEM_PROMPT = """\
-You are a precise information retrieval assistant. Given a question and a numbered list of paragraphs from a research paper, identify ALL paragraphs that contain evidence relevant to answering the question.
+Your task: identify which paragraphs contain evidence relevant to answering QUESTION.
 
-Rules:
-- Include every paragraph that contains relevant evidence — do not omit any
-- Do not include paragraphs that are irrelevant
-- If no paragraph is relevant, return an empty list
+Use Python to split TEXT into paragraphs and collect the relevant ones into a list. \
+Each element of the list must be an exact paragraph from TEXT (no paraphrasing or modifications).
+
+When you have finished, store the list of relevant paragraphs in a variable named `answer` and \
+call FINAL_VAR(answer). Example:
+```python
+answer = ["full paragraph text 1", "full paragraph text 2"]
+FINAL_VAR(answer)
+```
+
+QUESTION: {question}
+
+TEXT:
+{text}
 """
 
-RESPONSE_FORMAT = {
-    "type": "json_schema",
-    "json_schema": {
-        "name": "relevant_indices",
-        "strict": True,
-        "schema": {
-            "type": "object",
-            "properties": {
-                "indices": {
-                    "type": "array",
-                    "items": {"type": "integer"},
-                    "description": "Indices of paragraphs that contain evidence relevant to the question",
-                }
-            },
-            "required": ["indices"],
-            "additionalProperties": False,
+
+def retrieve_relevant_substrings(question: str, text: str) -> list[str]:
+    rlm = RLM(
+        backend="openrouter",
+        backend_kwargs={
+            "model_name": MODEL,
+            "api_key": os.getenv("OPENROUTER_API_KEY"),
         },
-    },
-}
-
-
-def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> list[tuple[int, int, str]]:
-    chunks = []
-    start = 0
-    while start < len(text):
-        end = min(start + chunk_size, len(text))
-        chunks.append((start, end, text[start:end]))
-        if end == len(text):
-            break
-        start += chunk_size - overlap
-    return chunks
-
-
-def retrieve_relevant_indices(question: str, chunks: list[tuple[int, int, str]]) -> list[int]:
-    numbered = "\n\n".join(f"[{i}] {c[2]}" for i, c in enumerate(chunks))
-    user_msg = f"Question: {question}\n\nParagraphs:\n{numbered}"
-
-    response = client.chat.completions.create(
-        model=MODEL,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_msg},
-        ],
-        response_format=RESPONSE_FORMAT,
-        temperature=0,
+        environment="local",
+        max_depth=2,
+        max_iterations=10,
+        verbose=False,
     )
 
-    result = json.loads(response.choices[0].message.content)
-    indices = result["indices"]
-    return [i for i in indices if 0 <= i < len(chunks)]
+    result = rlm.completion(TASK_PROMPT.format(question=question, text=text))
+    response = result.response or ""
+
+    u = result.usage_summary
+    cost_str = f"${u.total_cost:.6f}" if u.total_cost is not None else "n/a"
+    print(
+        f"RLM STATS | time={result.execution_time:.2f}s "
+        f"in={u.total_input_tokens:,} out={u.total_output_tokens:,} cost={cost_str}"
+    )
+    print("RLM RESPONSE", response)
+
+    try:
+        substrings = ast.literal_eval(response)
+        if isinstance(substrings, list):
+            return [s for s in substrings if isinstance(s, str)]
+    except (ValueError, SyntaxError):
+        pass
+
+    return []
 
 
 def merge_intervals(intervals: list[tuple[int, int]]) -> list[tuple[int, int]]:
@@ -130,7 +120,6 @@ def process_sample(i: int, sample: dict, total: int) -> dict | None:
         return None
 
     text = "\n\n".join(paragraphs)
-    chunks = chunk_text(text)
 
     evidence_intervals = []
     for ev in evidence:
@@ -146,10 +135,16 @@ def process_sample(i: int, sample: dict, total: int) -> dict | None:
         return None
 
     try:
-        indices = retrieve_relevant_indices(question, chunks)
-        retrieved_intervals = [(chunks[idx][0], chunks[idx][1]) for idx in indices]
+        substrings = retrieve_relevant_substrings(question, text)
+        retrieved_intervals = []
+        for s in substrings:
+            idx = text.find(s)
+            if idx != -1:
+                retrieved_intervals.append((idx, idx + len(s)))
     except Exception as e:
+        import traceback
         print(f"[{i+1}/{total}] Skipping — retrieval failed ({e})")
+        traceback.print_exc()
         return None
 
     metrics = compute_metrics(retrieved_intervals, evidence_intervals)
@@ -186,6 +181,9 @@ def main():
             evaluated += 1
 
     print(f"\nAverage over {evaluated} samples:")
+    if evaluated == 0:
+        print("  No samples evaluated.")
+        return
     print(f"  Precision : {total_precision / evaluated:.4f}")
     print(f"  Recall    : {total_recall / evaluated:.4f}")
     print(f"  F1        : {total_f1 / evaluated:.4f}")
