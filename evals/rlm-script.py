@@ -8,7 +8,7 @@ from rlm import RLM
 
 load_dotenv()
 
-MAX_SAMPLES = 10
+MAX_SAMPLES = 1
 MODEL = "inception/mercury-2"
 
 SYSTEM_PROMPT_TEMPLATE = """\
