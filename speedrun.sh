@@ -7,7 +7,7 @@ output=$(uv run \
   --with rlms==0.1.1 \
   --with python-dotenv==1.2.2 \
   --with openai==2.26.0 \
-  evals/rlm-gemini.py | tee /dev/stderr)
+  evals/rlm.py | tee /dev/stderr)
 
 summary=$(echo "$output" | awk '/^Average over /,0')
 

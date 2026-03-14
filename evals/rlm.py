@@ -1,45 +1,134 @@
 import ast
 import os
 import json
+import re
+from dataclasses import dataclass
 from dotenv import load_dotenv
 from rlm import RLM
 
 load_dotenv()
 
-MAX_SAMPLES = None
-MODEL = "openai/gpt-5-mini"
+MAX_SAMPLES = 1
+MODEL = "inception/mercury-2"
 
-TASK_PROMPT = """\
-You are given the full text of a research paper and a question about it.
-
-Your task: find all substrings from TEXT that contain evidence relevant to answering QUESTION.
-
-Instructions:
-- Use keyword/string search in Python to locate candidate excerpts efficiently. \
-Think about what words or phrases would appear near the answer and search for them.
-- NEVER pass the full TEXT or large chunks to llm_query — it is too slow and expensive. \
-Any string passed to llm_query must be under 4000 characters.
-- Only call llm_query on short candidate excerpts to judge their relevance.
-- Returned substrings must be exact character-for-character slices of TEXT (use TEXT[start:end]). \
-Do NOT paraphrase or modify them.
-- Each substring should be full logical sentences / a paragraph-sized excerpt — not just a few \
-words.
-
-When you have finished, store the list of relevant substrings in a variable named `answer` and \
-call FINAL_VAR(answer). Example:
-```python
-answer = ["exact slice 1", "exact slice 2"]
-FINAL_VAR(answer)
-```
+SYSTEM_PROMPT_TEMPLATE = """\
+You are an evidence retrieval agent. The variable `TEXT` contains a research paper.
 
 QUESTION: {question}
 
-TEXT:
-{text}
+{custom_tools_section}
+
+RULES:
+- Output ONLY ```repl code blocks. No narration, no explanation, no text outside code blocks.
+- Do NOT call llm_query or rlm_query. Do NOT write string search code. Use ONLY the helpers.
+- Your final answer MUST be FINAL_VAR(list_of_strings) where each string is an exact slice of TEXT.
+- Each returned substring should be 2-5 sentences of surrounding context, not just the exact \
+words that answer the question. Include the full sentence and relevant neighbors.
+- Do NOT answer the question. Return the evidence substrings, nothing else.
+
+search_all prints every hit's full text automatically. Read them, then select/trim.
+
+Example (2 iterations):
+
+```repl
+hits = search_all(["keyword1", "keyword2", "method_name"])
+```
+
+```repl
+answer = [select(hits, 0), trim(hits[2], "start phrase", "end phrase."), select(hits, 4)]
+FINAL_VAR(answer)
+```
 """
 
 
+@dataclass
+class Hit:
+    start: int
+    text: str
+
+    def __repr__(self):
+        return f"[pos={self.start} len={len(self.text)}] {self.text!r}"
+
+
+def _make_tools(text: str) -> dict:
+    def search(keyword: str, window: int = 300) -> list:
+        hits = []
+        pattern = re.compile(re.escape(keyword), re.IGNORECASE)
+        for m in pattern.finditer(text):
+            left = max(0, m.start() - window // 2)
+            right = min(len(text), m.end() + window // 2)
+            while left > 0 and text[left - 1] not in ".!?\n":
+                left -= 1
+                if m.start() - left > window:
+                    break
+            while right < len(text) and text[right] not in ".!?\n":
+                right += 1
+                if right - m.end() > window:
+                    break
+            if right < len(text) and text[right] in ".!?\n":
+                right += 1
+            hits.append(Hit(start=left, text=text[left:right]))
+        return _merge_hits(hits)
+
+    def _merge_hits(hits: list) -> list:
+        if not hits:
+            return []
+        intervals = sorted([(h.start, h.start + len(h.text)) for h in hits])
+        merged = [intervals[0]]
+        for s, e in intervals[1:]:
+            if s <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+            else:
+                merged.append((s, e))
+        return [Hit(start=s, text=text[s:e]) for s, e in merged]
+
+    def search_all(keywords: list, window: int = 300) -> list:
+        all_hits = []
+        for kw in keywords:
+            all_hits.extend(search(kw, window))
+        merged = _merge_hits(all_hits)
+        for i, h in enumerate(merged):
+            print(f"--- hit {i} ---")
+            print(h.text)
+        if not merged:
+            print("(no hits)")
+        return merged
+
+    def select(hits: list, index: int) -> str:
+        return hits[index].text
+
+    def trim(hit, start_phrase: str, end_phrase: str) -> str:
+        t = hit.text if isinstance(hit, Hit) else hit
+        s = hit.start if isinstance(hit, Hit) else 0
+        si = t.lower().find(start_phrase.lower())
+        if si == -1:
+            si = 0
+        ei = t.lower().find(end_phrase.lower(), si)
+        if ei == -1:
+            return t[si:]
+        return text[s + si : s + ei + len(end_phrase)]
+
+    def expand(hit, chars: int = 200, left: int | None = None, right: int | None = None):
+        l = left if left is not None else chars
+        r = right if right is not None else chars
+        new_start = max(0, hit.start - l)
+        new_end = min(len(text), hit.start + len(hit.text) + r)
+        return Hit(start=new_start, text=text[new_start:new_end])
+
+    return {
+        "search": search,
+        "search_all": search_all,
+        "select": select,
+        "trim": trim,
+        "expand": expand,
+        "TEXT": text,
+        "Hit": Hit,
+    }
+
+
 def retrieve_relevant_substrings(question: str, text: str) -> tuple[list[str], dict]:
+    tools = _make_tools(text)
+    system_prompt = SYSTEM_PROMPT_TEMPLATE.replace("{question}", question)
     rlm = RLM(
         backend="openrouter",
         backend_kwargs={
@@ -47,12 +136,24 @@ def retrieve_relevant_substrings(question: str, text: str) -> tuple[list[str], d
             "api_key": os.getenv("OPENROUTER_API_KEY"),
         },
         environment="local",
-        max_depth=2,
-        max_iterations=10,
-        verbose=False,
+        max_depth=1,
+        max_iterations=5,
+        verbose=True,
+        custom_tools=tools,
+        custom_system_prompt=system_prompt,
     )
 
-    result = rlm.completion(TASK_PROMPT.format(question=question, text=text))
+    import time as _time
+    for _attempt in range(3):
+        try:
+            result = rlm.completion("Find evidence substrings in TEXT for the question above.")
+            break
+        except (ValueError, RuntimeError) as e:
+            print(f"Retry {_attempt+1}/3 — {e}", flush=True)
+            if _attempt < 2:
+                _time.sleep(2 ** _attempt)
+                continue
+            raise
     response = result.response or ""
 
     u = result.usage_summary
