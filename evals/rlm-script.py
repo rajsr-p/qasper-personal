@@ -8,8 +8,8 @@ from rlm import RLM
 
 load_dotenv()
 
-MAX_SAMPLES = 1
-MODEL = "openai/gpt-5-mini"
+MAX_SAMPLES = None
+MODEL = "inception/mercury-2"
 
 SYSTEM_PROMPT_TEMPLATE = """\
 You are an evidence retrieval agent. The variable `TEXT` contains a research paper.
