@@ -2,19 +2,23 @@ import ast
 import os
 import json
 import re
-from dataclasses import dataclass
+import ray
 from dotenv import load_dotenv
 from rlm import RLM
 
 load_dotenv()
 
 MAX_SAMPLES = None
+BATCH_SIZE = 3
 MODEL = "mercury-2"
-USE_OPENROUTER = True
-OPENROUTER_MODEL = "google/gemini-3-flash-preview"
+USE_OPENROUTER = False
+OPENROUTER_MODEL = "anthropic/claude-opus-4.6"
 
 SYSTEM_PROMPT_TEMPLATE = """\
 You are an evidence retrieval agent. The variable `TEXT` contains a research paper.
+
+PAPER TITLE: {title}
+ABSTRACT: {abstract}
 
 QUESTION: {question}
 
@@ -24,7 +28,7 @@ RULES:
 - CRITICAL: Each response you give must contain EXACTLY ONE ```repl block. Never two, never zero. \
 You will be called multiple times. Each call = one block.
 - You can only see the output of a block AFTER you submit it. \
-So you CANNOT call extract_section() on the result of expand() in the same response — you haven't seen the expanded text yet.
+So you CANNOT call extract_section() on the result of search() in the same response — you haven't seen the text yet.
 - Do NOT call llm_query or rlm_query. Do NOT write string search code. Use ONLY the helpers.
 - Your final answer MUST be FINAL_VAR(list_of_strings) where each string is an exact slice of TEXT.
 - The returned evidence must be self-contained: a reader seeing ONLY your returned text \
@@ -33,17 +37,19 @@ one full paragraph (4+ sentences). Never return isolated sentences — always re
 paragraph surrounding the key fact, including its topic sentence and any follow-up details.
 - If you put two ```repl blocks in one response, the second block will be SILENTLY DROPPED. You will lose that work.
 - Do NOT answer the question. Return the evidence substrings, nothing else.
-- If need be, for search_all you may search with 2+ diverse terms extracted from the question (synonyms, abbreviations, \
-related concepts).
-- Search ONCE. Do not search again after your first search_all call — work with the hits you have.
-- Always expand if a hit ends mid-paragraph or might be missing adjacent relevant content. \
-When expanding, use at least chars=800 to capture full paragraphs. More context is always better — \
-you can trim with extract_section later.
+- You can call search() multiple times in a single repl block to search for different keywords in parallel.
+- If your initial search results lack promising snippets, search again with different \
+query terms (synonyms, rephrased concepts, abbreviations). Don't repeat the same keywords.
+- To expand a snippet, call search() on the snippet itself with a larger window \
+and bidirectional=False. This re-finds the same location and returns more surrounding context. \
+NOTE: you do not actually need to re-write out the snippet, it should be saved in an array/variable \
+that you can just index. i.e. search(s[0], window=1000). When specifically trying to expand, we encourage \
+window sizes of 1000+ characters.
 - No narration, no explanation, no text outside code blocks.
 
-search_all prints every hit's full text automatically. Read them carefully. \
-After search_all, identify ALL hits that could be relevant — evidence is often spread across multiple sections \
-of a paper (e.g. intro, methods, experiments may all contain relevant details). Expand each promising hit generously. \
+search() prints every snippet with its starting character position. Read them carefully. \
+After searching, identify ALL snippets that could be relevant — evidence is often spread across multiple sections \
+of a paper (e.g. intro, methods, experiments may all contain relevant details). Expand each promising snippet generously. \
 Then in the NEXT response (after you have read the expanded text), use extract_section to return \
 the full section/paragraph that contains the evidence. Prefer returning too much over too little.
 
@@ -51,45 +57,54 @@ The procedure is exactly 3 responses:
 
 Response 1:
 ```repl
-hits = search_all(["keyword1", "keyword2"])
+s1 = search("keyword1")
+s2 = search("keyword2")
 ```
 
-Response 2 (after reading the search results, expand ALL promising hits — cast a wide net):
+Response 2 (after reading the search results, expand ALL promising snippets by re-searching them with a larger window):
 ```repl
-h1 = expand(hits[0], chars=800)
-h2 = expand(hits[3], chars=800)
-h3 = expand(hits[7], chars=800)
+e1 = search(s1[0], window=1000, bidirectional=False)
+e2 = search(s1[3], window=1000, bidirectional=False)
+e3 = search(s2[1], window=1000, bidirectional=False)
 ```
 
 Response 3 (after reading the expanded text, return the full relevant paragraph(s) using extract_section. \
 Always set start_phrase to a short phrase from the BEGINNING of the paragraph, not from the sentence containing the keyword, \
 and end_phrase to a short phrase from the LAST sentence of the paragraph):
 ```repl
-answer = [extract_section(h1, "beginning phrase of paragraph", "ending phrase of paragraph."), extract_section(h2, "beginning phrase of paragraph", "ending phrase of paragraph."), extract_section(h3, "beginning phrase of paragraph", "ending phrase of paragraph.")]
+answer = [extract_section(e1[0], "beginning phrase of paragraph", "ending phrase of paragraph."), extract_section(e2[0], "beginning phrase of paragraph", "ending phrase of paragraph."), extract_section(e3[0], "beginning phrase of paragraph", "ending phrase of paragraph.")]
 FINAL_VAR(answer)
 ```
 """
 
 
-@dataclass
-class Hit:
-    start: int
-    text: str
-
-    def __repr__(self):
-        return f"[pos={self.start} len={len(self.text)}] {self.text!r}"
-
 
 def _make_tools(text: str) -> dict:
-    def search(keyword: str, window: int = 300) -> list:
-        hits = []
+    def _merge(items: list[tuple[int, str]]) -> list[tuple[int, str]]:
+        if not items:
+            return []
+        intervals = sorted([(s, s + len(t)) for s, t in items])
+        merged = [intervals[0]]
+        for s, e in intervals[1:]:
+            if s <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+            else:
+                merged.append((s, e))
+        return [(s, text[s:e]) for s, e in merged]
+
+    def search(keyword: str, window: int = 300, max_snippets: int = 10, bidirectional: bool = True) -> list[str]:
+        results = []
         pattern = re.compile(re.escape(keyword), re.IGNORECASE)
         for m in pattern.finditer(text):
-            left = max(0, m.start() - window // 2)
-            right = min(len(text), m.end() + window // 2)
+            if bidirectional:
+                left = max(0, m.start() - window // 2)
+                right = min(len(text), m.end() + window // 2)
+            else:
+                left = m.start()
+                right = min(len(text), m.start() + window)
             while left > 0 and text[left - 1] not in ".!?\n":
                 left -= 1
-                if m.start() - left > window:
+                if m.start() - left > (window if bidirectional else 100):
                     break
             while right < len(text) and text[right] not in ".!?\n":
                 right += 1
@@ -97,80 +112,49 @@ def _make_tools(text: str) -> dict:
                     break
             if right < len(text) and text[right] in ".!?\n":
                 right += 1
-            hits.append(Hit(start=left, text=text[left:right]))
-        return _merge_hits(hits)
+            results.append((left, text[left:right]))
+        merged = _merge(results)
+        shown = merged[:max_snippets]
+        remaining = len(merged) - len(shown)
+        snippets = []
+        for start, snippet in shown:
+            idx = len(snippets)
+            print(f"--- snippet {idx} ---")
+            print(snippet)
+            snippets.append(snippet)
+        if not shown:
+            print(f"(no hits for {keyword!r})")
+        if remaining > 0:
+            print(f"(+{remaining} more)")
+        return snippets
 
-    def _merge_hits(hits: list) -> list:
-        if not hits:
-            return []
-        intervals = sorted([(h.start, h.start + len(h.text)) for h in hits])
-        merged = [intervals[0]]
-        for s, e in intervals[1:]:
-            if s <= merged[-1][1]:
-                merged[-1] = (merged[-1][0], max(merged[-1][1], e))
-            else:
-                merged.append((s, e))
-        return [Hit(start=s, text=text[s:e]) for s, e in merged]
-
-    def search_all(keywords: list, window: int = 300, max_snippets: int = 10) -> list:
-        all_hits = []
-        for kw in keywords:
-            hits = search(kw, window)
-            shown = hits[:max_snippets]
-            remaining = len(hits) - len(shown)
-
-            for i, h in enumerate(shown):
-                print(f"--- hit {i} for {kw!r} ---")
-                print(h.text)
-            if not shown:
-                print(f"(no hits for {kw!r})")
-            if remaining > 0:
-                print(f"(+{remaining} more for {kw!r})")
-            all_hits.extend(shown)
-        return all_hits
-
-    def select(hits: list, index: int) -> str:
-        result = hits[index].text
-        print(result)
-        return result
-
-    def extract_section(hit, start_phrase: str, end_phrase: str) -> str:
-        t = hit.text if isinstance(hit, Hit) else hit
-        s = hit.start if isinstance(hit, Hit) else 0
-        si = t.lower().find(start_phrase.lower())
+    def extract_section(snippet: str, start_phrase: str, end_phrase: str) -> str:
+        si = snippet.lower().find(start_phrase.lower())
         if si == -1:
             si = 0
-        ei = t.lower().find(end_phrase.lower(), si)
+        ei = snippet.lower().find(end_phrase.lower(), si)
         if ei == -1:
-            result = t[si:]
+            result = snippet[si:]
         else:
-            result = text[s + si : s + ei + len(end_phrase)]
+            result = snippet[si:ei + len(end_phrase)]
         print(result)
-        return result
-
-    def expand(hit, chars: int = 200, left: int | None = None, right: int | None = None):
-        l = left if left is not None else chars
-        r = right if right is not None else chars
-        new_start = max(0, hit.start - l)
-        new_end = min(len(text), hit.start + len(hit.text) + r)
-        result = Hit(start=new_start, text=text[new_start:new_end])
-        print(result.text)
         return result
 
     return {
         "search": search,
-        "search_all": search_all,
-        "select": select,
         "extract_section": extract_section,
-        "expand": expand,
         "TEXT": text,
-        "Hit": Hit,
     }
 
 
-def retrieve_relevant_substrings(question: str, text: str) -> tuple[list[str], dict]:
+def retrieve_relevant_substrings(question: str, text: str, title: str = "", abstract: str = "") -> tuple[list[str], dict]:
     tools = _make_tools(text)
-    system_prompt = SYSTEM_PROMPT_TEMPLATE.replace("{question}", question)
+    system_prompt = (
+        SYSTEM_PROMPT_TEMPLATE
+        .replace("{title}", title)
+        .replace("{abstract}", abstract)
+        .replace("{question}", question)
+    )
     if USE_OPENROUTER:
         backend = "openrouter"
         backend_kwargs = {
@@ -278,6 +262,8 @@ def compute_metrics(retrieved_intervals: list[tuple[int, int]], evidence_interva
 
 def process_sample(i: int, sample: dict, total: int) -> dict | None:
     question = sample["question"]
+    title = sample.get("title", "")
+    abstract = sample.get("abstract", "")
     paragraphs = sample["paragraphs"]
     evidence = sample["evidence"]
 
@@ -301,7 +287,7 @@ def process_sample(i: int, sample: dict, total: int) -> dict | None:
         return None
 
     try:
-        substrings, rlm_stats = retrieve_relevant_substrings(question, text)
+        substrings, rlm_stats = retrieve_relevant_substrings(question, text, title, abstract)
         retrieved_intervals = []
         for s in substrings:
             idx = text.find(s)
@@ -322,7 +308,15 @@ def process_sample(i: int, sample: dict, total: int) -> dict | None:
     return {**metrics, "rlm_stats": rlm_stats}
 
 
+@ray.remote
+def process_sample_remote(i, sample, total):
+    load_dotenv()
+    return process_sample(i, sample, total)
+
+
 def main():
+    ray.init(ignore_reinit_error=True)
+
     with open("qasper-test.json") as f:
         data = json.load(f)
 
@@ -332,20 +326,28 @@ def main():
     total_time = total_input = total_output = total_cost = 0.0
     evaluated = 0
 
-    for i, sample in enumerate(samples):
-        result = process_sample(i, sample, len(samples))
-        if result is None:
-            continue
+    for batch_start in range(0, len(samples), BATCH_SIZE):
+        batch = samples[batch_start:batch_start + BATCH_SIZE]
+        futures = [
+            process_sample_remote.remote(batch_start + j, sample, len(samples))
+            for j, sample in enumerate(batch)
+        ]
+        results = ray.get(futures)
 
-        total_precision += result["precision"]
-        total_recall += result["recall"]
-        total_f1 += result["f1"]
-        s = result["rlm_stats"]
-        total_time += s["time"]
-        total_input += s["input_tokens"]
-        total_output += s["output_tokens"]
-        total_cost += s["cost"]
-        evaluated += 1
+        for result in results:
+            if result is None:
+                continue
+            total_precision += result["precision"]
+            total_recall += result["recall"]
+            total_f1 += result["f1"]
+            s = result["rlm_stats"]
+            total_time += s["time"]
+            total_input += s["input_tokens"]
+            total_output += s["output_tokens"]
+            total_cost += s["cost"]
+            evaluated += 1
+
+    ray.shutdown()
 
     print(f"\nAverage over {evaluated} samples:")
     if evaluated == 0:
