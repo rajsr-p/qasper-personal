@@ -8,7 +8,7 @@ from rlm import RLM
 
 load_dotenv()
 
-MAX_SAMPLES = 10
+MAX_SAMPLES = None
 MODEL = "mercury-2"
 USE_OPENROUTER = True
 OPENROUTER_MODEL = "google/gemini-3-flash-preview"
