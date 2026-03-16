@@ -8,12 +8,12 @@ from rlm import RLM
 
 load_dotenv()
 
-MAX_SAMPLES = None
+MAX_SAMPLES = 10
 SKIP = 0
-BATCH_SIZE = 10
+BATCH_SIZE = 3
 MODEL = "mercury-2"
 USE_OPENROUTER = True
-OPENROUTER_MODEL = "anthropic/claude-opus-4.6"
+OPENROUTER_MODEL = "openai/gpt-5-mini"
 
 SYSTEM_PROMPT_TEMPLATE = """\
 You are an evidence retrieval agent. The variable `TEXT` contains a research paper.
@@ -26,6 +26,7 @@ QUESTION: {question}
 {custom_tools_section}
 
 RULES:
+- Output ONLY ```repl code blocks. No narration, no explanation, no text outside code blocks.
 - CRITICAL: Each response you give must contain EXACTLY ONE ```repl block. Never two, never zero. \
 You will be called multiple times. Each call = one block.
 - You can only see the output of a block AFTER you submit it. \
@@ -54,7 +55,7 @@ of a paper (e.g. intro, methods, experiments may all contain relevant details). 
 Then in the NEXT response (after you have read the expanded text), use extract_section to return \
 the full section/paragraph that contains the evidence. Prefer returning too much over too little.
 
-The procedure is exactly 3 responses:
+Here is an example procedure with 3 responses (can be more if you need to search more to find relevant snippets)
 
 Response 1:
 ```repl
@@ -150,11 +151,25 @@ def _make_tools(text: str) -> dict:
 
 def retrieve_relevant_substrings(question: str, text: str, title: str = "", abstract: str = "") -> tuple[list[str], dict]:
     tools = _make_tools(text)
+    custom_tools_section = (
+        "AVAILABLE TOOLS:\n"
+        "- TEXT: a string variable containing the full paper text.\n"
+        "- search(keyword: str, window: int = 300, max_snippets: int = 10, bidirectional: bool = True) -> list[str]\n"
+        "    Searches TEXT for all occurrences of `keyword` (case-insensitive) and returns surrounding context snippets.\n"
+        "    `window` controls how many characters of context to include.\n"
+        "    `bidirectional=True` centers the window on the match; `False` starts from the match position.\n"
+        "    Returns a list of snippet strings.\n"
+        "- extract_section(snippet: str, start_phrase: str, end_phrase: str) -> str\n"
+        "    Extracts a substring from `snippet` starting at `start_phrase` and ending at `end_phrase` (inclusive).\n"
+        "    Both phrases are matched case-insensitively.\n"
+        "- FINAL_VAR(value): call this with your final answer to submit it."
+    )
     system_prompt = (
         SYSTEM_PROMPT_TEMPLATE
         .replace("{title}", title)
         .replace("{abstract}", abstract)
         .replace("{question}", question)
+        .replace("{custom_tools_section}", custom_tools_section)
     )
     if USE_OPENROUTER:
         backend = "openrouter"
@@ -176,7 +191,7 @@ def retrieve_relevant_substrings(question: str, text: str, title: str = "", abst
         environment="local",
         max_depth=1,
         max_iterations=20,
-        verbose=True,
+        verbose=False,
         custom_tools=tools,
         custom_system_prompt=system_prompt,
     )
