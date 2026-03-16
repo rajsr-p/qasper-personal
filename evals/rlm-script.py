@@ -9,7 +9,9 @@ from rlm import RLM
 load_dotenv()
 
 MAX_SAMPLES = 10
-MODEL = "inception/mercury-2"
+MODEL = "mercury-2"
+USE_OPENROUTER = True
+OPENROUTER_MODEL = "google/gemini-3-flash-preview"
 
 SYSTEM_PROMPT_TEMPLATE = """\
 You are an evidence retrieval agent. The variable `TEXT` contains a research paper.
@@ -19,23 +21,51 @@ QUESTION: {question}
 {custom_tools_section}
 
 RULES:
-- Output ONLY ```repl code blocks. No narration, no explanation, no text outside code blocks.
+- CRITICAL: Each response you give must contain EXACTLY ONE ```repl block. Never two, never zero. \
+You will be called multiple times. Each call = one block.
+- You can only see the output of a block AFTER you submit it. \
+So you CANNOT call extract_section() on the result of expand() in the same response — you haven't seen the expanded text yet.
 - Do NOT call llm_query or rlm_query. Do NOT write string search code. Use ONLY the helpers.
 - Your final answer MUST be FINAL_VAR(list_of_strings) where each string is an exact slice of TEXT.
-- Each returned substring should be 2-5 sentences of surrounding context, not just the exact \
-words that answer the question. Include the full sentence and relevant neighbors.
+- The returned evidence must be self-contained: a reader seeing ONLY your returned text \
+should have enough context to fully answer the question. Each evidence string MUST be at least \
+one full paragraph (4+ sentences). Never return isolated sentences — always return the complete \
+paragraph surrounding the key fact, including its topic sentence and any follow-up details.
+- If you put two ```repl blocks in one response, the second block will be SILENTLY DROPPED. You will lose that work.
 - Do NOT answer the question. Return the evidence substrings, nothing else.
+- If need be, for search_all you may search with 2+ diverse terms extracted from the question (synonyms, abbreviations, \
+related concepts).
+- Search ONCE. Do not search again after your first search_all call — work with the hits you have.
+- Always expand if a hit ends mid-paragraph or might be missing adjacent relevant content. \
+When expanding, use at least chars=800 to capture full paragraphs. More context is always better — \
+you can trim with extract_section later.
+- No narration, no explanation, no text outside code blocks.
 
-search_all prints every hit's full text automatically. Read them, then select/trim.
+search_all prints every hit's full text automatically. Read them carefully. \
+After search_all, identify ALL hits that could be relevant — evidence is often spread across multiple sections \
+of a paper (e.g. intro, methods, experiments may all contain relevant details). Expand each promising hit generously. \
+Then in the NEXT response (after you have read the expanded text), use extract_section to return \
+the full section/paragraph that contains the evidence. Prefer returning too much over too little.
 
-Example (2 iterations):
+The procedure is exactly 3 responses:
 
+Response 1:
 ```repl
-hits = search_all(["keyword1", "keyword2", "method_name"])
+hits = search_all(["keyword1", "keyword2"])
 ```
 
+Response 2 (after reading the search results, expand ALL promising hits — cast a wide net):
 ```repl
-answer = [select(hits, 0), trim(hits[2], "start phrase", "end phrase."), select(hits, 4)]
+h1 = expand(hits[0], chars=800)
+h2 = expand(hits[3], chars=800)
+h3 = expand(hits[7], chars=800)
+```
+
+Response 3 (after reading the expanded text, return the full relevant paragraph(s) using extract_section. \
+Always set start_phrase to a short phrase from the BEGINNING of the paragraph, not from the sentence containing the keyword, \
+and end_phrase to a short phrase from the LAST sentence of the paragraph):
+```repl
+answer = [extract_section(h1, "beginning phrase of paragraph", "ending phrase of paragraph."), extract_section(h2, "beginning phrase of paragraph", "ending phrase of paragraph."), extract_section(h3, "beginning phrase of paragraph", "ending phrase of paragraph.")]
 FINAL_VAR(answer)
 ```
 """
@@ -82,22 +112,29 @@ def _make_tools(text: str) -> dict:
                 merged.append((s, e))
         return [Hit(start=s, text=text[s:e]) for s, e in merged]
 
-    def search_all(keywords: list, window: int = 300) -> list:
+    def search_all(keywords: list, window: int = 300, max_snippets: int = 10) -> list:
         all_hits = []
         for kw in keywords:
-            all_hits.extend(search(kw, window))
-        merged = _merge_hits(all_hits)
-        for i, h in enumerate(merged):
-            print(f"--- hit {i} ---")
-            print(h.text)
-        if not merged:
-            print("(no hits)")
-        return merged
+            hits = search(kw, window)
+            shown = hits[:max_snippets]
+            remaining = len(hits) - len(shown)
+
+            for i, h in enumerate(shown):
+                print(f"--- hit {i} for {kw!r} ---")
+                print(h.text)
+            if not shown:
+                print(f"(no hits for {kw!r})")
+            if remaining > 0:
+                print(f"(+{remaining} more for {kw!r})")
+            all_hits.extend(shown)
+        return all_hits
 
     def select(hits: list, index: int) -> str:
-        return hits[index].text
+        result = hits[index].text
+        print(result)
+        return result
 
-    def trim(hit, start_phrase: str, end_phrase: str) -> str:
+    def extract_section(hit, start_phrase: str, end_phrase: str) -> str:
         t = hit.text if isinstance(hit, Hit) else hit
         s = hit.start if isinstance(hit, Hit) else 0
         si = t.lower().find(start_phrase.lower())
@@ -105,21 +142,26 @@ def _make_tools(text: str) -> dict:
             si = 0
         ei = t.lower().find(end_phrase.lower(), si)
         if ei == -1:
-            return t[si:]
-        return text[s + si : s + ei + len(end_phrase)]
+            result = t[si:]
+        else:
+            result = text[s + si : s + ei + len(end_phrase)]
+        print(result)
+        return result
 
     def expand(hit, chars: int = 200, left: int | None = None, right: int | None = None):
         l = left if left is not None else chars
         r = right if right is not None else chars
         new_start = max(0, hit.start - l)
         new_end = min(len(text), hit.start + len(hit.text) + r)
-        return Hit(start=new_start, text=text[new_start:new_end])
+        result = Hit(start=new_start, text=text[new_start:new_end])
+        print(result.text)
+        return result
 
     return {
         "search": search,
         "search_all": search_all,
         "select": select,
-        "trim": trim,
+        "extract_section": extract_section,
         "expand": expand,
         "TEXT": text,
         "Hit": Hit,
@@ -129,15 +171,26 @@ def _make_tools(text: str) -> dict:
 def retrieve_relevant_substrings(question: str, text: str) -> tuple[list[str], dict]:
     tools = _make_tools(text)
     system_prompt = SYSTEM_PROMPT_TEMPLATE.replace("{question}", question)
-    rlm = RLM(
-        backend="openrouter",
-        backend_kwargs={
-            "model_name": MODEL,
+    if USE_OPENROUTER:
+        backend = "openrouter"
+        backend_kwargs = {
             "api_key": os.getenv("OPENROUTER_API_KEY"),
-        },
+            "model_name": OPENROUTER_MODEL,
+        }
+    else:
+        backend = "openai"
+        backend_kwargs = {
+            "model_name": MODEL,
+            "api_key": os.getenv("INCEPTION_API_KEY"),
+            "base_url": "https://api.inceptionlabs.ai/v1",
+        }
+
+    rlm = RLM(
+        backend=backend,
+        backend_kwargs=backend_kwargs,
         environment="local",
         max_depth=1,
-        max_iterations=5,
+        max_iterations=20,
         verbose=True,
         custom_tools=tools,
         custom_system_prompt=system_prompt,
@@ -305,8 +358,6 @@ def main():
     print(f"  Time      : {total_time / evaluated:.2f}s")
     print(f"  Input tok : {total_input / evaluated:,.0f}")
     print(f"  Output tok: {total_output / evaluated:,.0f}")
-    print(f"  Cost      : ${total_cost / evaluated:.6f}")
-    print(f"  Total cost: ${total_cost:.4f}")
 
 
 if __name__ == "__main__":
