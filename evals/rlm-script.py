@@ -9,9 +9,10 @@ from rlm import RLM
 load_dotenv()
 
 MAX_SAMPLES = None
-BATCH_SIZE = 3
+SKIP = 0
+BATCH_SIZE = 10
 MODEL = "mercury-2"
-USE_OPENROUTER = False
+USE_OPENROUTER = True
 OPENROUTER_MODEL = "anthropic/claude-opus-4.6"
 
 SYSTEM_PROMPT_TEMPLATE = """\
@@ -267,6 +268,8 @@ def process_sample(i: int, sample: dict, total: int) -> dict | None:
     paragraphs = sample["paragraphs"]
     evidence = sample["evidence"]
 
+    print(f"[{i+1}/{total}] Question: {question}", flush=True)
+
     if not paragraphs or not evidence:
         print(f"[{i+1}/{total}] Skipping — no paragraphs or evidence", flush=True)
         return None
@@ -320,7 +323,7 @@ def main():
     with open("qasper-test.json") as f:
         data = json.load(f)
 
-    samples = data if MAX_SAMPLES is None else data[:MAX_SAMPLES]
+    samples = data[SKIP:] if MAX_SAMPLES is None else data[SKIP:SKIP + MAX_SAMPLES]
 
     total_precision = total_recall = total_f1 = 0.0
     total_time = total_input = total_output = total_cost = 0.0
