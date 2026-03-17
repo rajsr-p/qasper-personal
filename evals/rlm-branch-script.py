@@ -8,12 +8,12 @@ from rlm import RLM
 
 load_dotenv()
 
-MAX_SAMPLES = None
+MAX_SAMPLES = 1
 SKIP = 0
 BATCH_SIZE = 10
 MODEL = "mercury-2"
 USE_OPENROUTER = True
-OPENROUTER_MODEL = "qwen/qwen3.5-27b"
+OPENROUTER_MODEL = "google/gemini-3-flash-preview"
 
 SYSTEM_PROMPT_TEMPLATE = """\
 You are an evidence retrieval agent. The variable `TEXT` contains a research paper.
@@ -39,21 +39,61 @@ one full paragraph (4+ sentences). Never return isolated sentences — always re
 paragraph surrounding the key fact, including its topic sentence and any follow-up details.
 - If you put two ```repl blocks in one response, the second block will be SILENTLY DROPPED. You will lose that work.
 - Do NOT answer the question. Return the evidence substrings, nothing else.
+- No narration, no explanation, no text outside code blocks.
+
+Unless you are a worker agent, decompose the QUESTION into 3-4 focused sub-queries that each target a different aspect \
+of where evidence might be found in the paper (e.g. methodology, results/metrics, comparisons, \
+introduction claims, conclusion summary). Then dispatch them all at once.
+
+Each sub-query string you pass to rlm_query_batched will become the task for a child agent that \
+has the same tools (search, extract_section, TEXT) and the same system prompt. The child will \
+search the paper and return a list of evidence substrings for that sub-query.
+
+Coordinator procedure (2 responses):
+
+Response 1 — Decompose and dispatch:
+```repl
+results = rlm_query_batched([
+    "You are a WORKER agent. Find evidence passages about [specific aspect 1]. Search for keywords like [keyword suggestions].",
+    "You are a WORKER agent. Find evidence passages about [specific aspect 2]. Search for keywords like [keyword suggestions].",
+    "You are a WORKER agent. Find evidence passages about [specific aspect 3]. Search for keywords like [keyword suggestions].",
+])
+```
+
+Response 2 — Curate child results and return final answer. \
+results is a list of child responses (strings). Parse them, collect all passages, \
+drop duplicates and near-overlapping passages (keep the longer/more comprehensive one), \
+and return the best non-redundant set. You may call extract_section() to trim a passage if needed:
+```repl
+import ast
+all_passages = []
+for r in results:
+    try:
+        parsed = ast.literal_eval(r)
+        if isinstance(parsed, list):
+            all_passages.extend([p for p in parsed if isinstance(p, str)])
+    except:
+        pass
+final = []
+for p in sorted(all_passages, key=len, reverse=True):
+    if not any(p in existing or existing in p for existing in final):
+        final.append(p)
+FINAL_VAR(final)
+```
+
+=== WORKER MODE (use this if specified in user prompt) ===
+
+If rlm_query_batched is NOT available to you, you are a WORKER agent. \
+Use search() and extract_section() directly to find evidence.
+
 - You can call search() multiple times in a single repl block to search for different keywords in parallel.
 - If your initial search results lack promising snippets, search again with different \
 query terms (synonyms, rephrased concepts, abbreviations). Don't repeat the same keywords.
-- IMPORTANT: You have a HARD LIMIT of 10 search rounds. Do NOT spend more than 3-4 rounds searching. \
-If after 3 rounds of searching you haven't found new useful results, STOP searching and proceed to \
-expand + extract with the best evidence you already have. Something is always better than nothing.
-- Tables and figures are often missing from the text. If a question asks about specific numbers from a table \
-and you can find the paragraph that REFERENCES the table but not the table data itself, return that \
-referencing paragraph — do not keep searching for the numeric values.
 - To expand a snippet, call search() on the snippet itself with a larger window \
 and bidirectional=False. This re-finds the same location and returns more surrounding context. \
 NOTE: you do not actually need to re-write out the snippet, it should be saved in an array/variable \
 that you can just index. i.e. search(s[0], window=1000). When specifically trying to expand, we encourage \
 window sizes of 1000+ characters.
-- No narration, no explanation, no text outside code blocks.
 
 search() prints every snippet with its starting character position. Read them carefully. \
 After searching, identify ALL snippets that could be relevant — evidence is often spread across multiple sections \
@@ -61,7 +101,7 @@ of a paper (e.g. intro, methods, experiments may all contain relevant details). 
 Then in the NEXT response (after you have read the expanded text), use extract_section to return \
 the full section/paragraph that contains the evidence. Prefer returning too much over too little.
 
-Here is an example procedure with 3 responses (occasionally more, but NEVER more than 10 total rounds)
+Worker example procedure with 3 responses (can be more if you need to search more):
 
 Response 1:
 ```repl
@@ -195,9 +235,9 @@ def retrieve_relevant_substrings(question: str, text: str, title: str = "", abst
         backend=backend,
         backend_kwargs=backend_kwargs,
         environment="local",
-        max_depth=1,
+        max_depth=2,
         max_iterations=20,
-        verbose=False,
+        verbose=True,
         custom_tools=tools,
         custom_system_prompt=system_prompt,
     )
@@ -205,7 +245,7 @@ def retrieve_relevant_substrings(question: str, text: str, title: str = "", abst
     import time as _time
     for _attempt in range(3):
         try:
-            result = rlm.completion("Find evidence substrings in TEXT for the question above.")
+            result = rlm.completion("You are a coordinator agent (not worker agent). Find evidence substrings in TEXT for the question above.")
             break
         except (ValueError, RuntimeError) as e:
             print(f"Retry {_attempt+1}/3 — {e}", flush=True)
@@ -228,7 +268,7 @@ def retrieve_relevant_substrings(question: str, text: str, title: str = "", abst
         f"in={stats['input_tokens']:,} out={stats['output_tokens']:,} cost={cost_str}",
         flush=True,
     )
-    # print("RLM RESPONSE", response, flush=True)
+    print("RLM RESPONSE", response, flush=True)
 
     try:
         substrings = ast.literal_eval(response)
@@ -341,7 +381,7 @@ def process_sample_remote(i, sample, total):
 def main():
     ray.init(ignore_reinit_error=True)
 
-    with open("qasper-test.json") as f:
+    with open("qasper-sample.json") as f:
         data = json.load(f)
 
     samples = data[SKIP:] if MAX_SAMPLES is None else data[SKIP:SKIP + MAX_SAMPLES]

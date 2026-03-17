@@ -7,24 +7,38 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-MAX_SAMPLES = 10
+MAX_SAMPLES = None
 SKIP = 0
 BATCH_SIZE = 10
-WORDS_PER_LINE = 15
-# MODEL = "google/gemini-3-flash-preview"
-MODEL = "anthropic/claude-sonnet-4.6"
+MODEL = "mercury-2"
+USE_OPENROUTER = True
+OPENROUTER_MODEL = "google/gemini-3-flash-preview"
 
-client = OpenAI(
-    base_url="https://openrouter.ai/api/v1",
-    api_key=os.getenv("OPENROUTER_API_KEY"),
-)
+if USE_OPENROUTER:
+    client = OpenAI(
+        base_url="https://openrouter.ai/api/v1",
+        api_key=os.getenv("OPENROUTER_API_KEY"),
+    )
+else:
+    client = OpenAI(
+        base_url="https://api.inceptionlabs.ai/v1",
+        api_key=os.getenv("INCEPTION_API_KEY"),
+    )
 
 SYSTEM_PROMPT = """\
-You are a precise information retrieval assistant. Given a question and numbered lines from a research paper, identify ALL lines that contain evidence relevant to answering the question.
+You are an evidence retrieval assistant. Given a question and numbered lines from a research paper, identify ALL lines that contain evidence relevant to answering the question.
+
+The returned lines must be sufficient for a reader — seeing ONLY those lines — to fully answer the question. \
+If answering the question requires understanding context, definitions, methodology, or motivation, include those lines too.
 
 Rules:
-- Include every line that contains relevant evidence — do not omit any
-- Do not include lines that are irrelevant
+- Evidence for a question is often distributed across multiple sections of the paper \
+(e.g. introduction, methods, experiments, discussion). Search broadly — do not stop at the first or most obvious match.
+- When a line is relevant, include the ENTIRE paragraph or logical block it belongs to. \
+Do not cherry-pick isolated sentences from the middle of a paragraph — always include from the topic sentence \
+through the concluding sentence of that block. Paragraphs are separated by section headers or blank lines.
+- When in doubt about whether a line is relevant, include it. \
+Missing relevant evidence is a much bigger error than including a borderline line.
 - If no line is relevant, return an empty list
 - Return ranges as [start_line, end_line] pairs (inclusive)
 - Merge adjacent or overlapping ranges where possible
@@ -54,25 +68,39 @@ RESPONSE_FORMAT = {
 }
 
 
-def split_into_lines(text: str, words_per_line: int = WORDS_PER_LINE) -> list[tuple[int, int, str]]:
-    words_with_pos = [(m.start(), m.end(), m.group()) for m in re.finditer(r'\S+', text)]
-    lines = []
-    for i in range(0, len(words_with_pos), words_per_line):
-        group = words_with_pos[i:i + words_per_line]
-        char_start = group[0][0]
-        char_end = group[-1][1]
-        line_text = " ".join(w for _, _, w in group)
-        lines.append((char_start, char_end, line_text))
-    return lines
+def split_into_sentences(text: str) -> list[tuple[int, int, str]]:
+    boundaries = [m.end() for m in re.finditer(r'[.!?](?=\s|$)', text)]
+    if not boundaries or boundaries[-1] < len(text):
+        boundaries.append(len(text))
+
+    sentences = []
+    pos = 0
+    for boundary in boundaries:
+        chunk = text[pos:boundary]
+        stripped = chunk.strip()
+        if stripped:
+            leading = len(chunk) - len(chunk.lstrip())
+            char_start = pos + leading
+            char_end = char_start + len(stripped)
+            sentences.append((char_start, char_end, stripped))
+        pos = boundary
+    return sentences
 
 
-def retrieve_relevant_lines(question: str, lines: list[tuple[int, int, str]]) -> list[int]:
-    numbered = "\n".join(f"{i}: {line[2]}" for i, line in enumerate(lines))
-    # print("numbered", numbered)
-    user_msg = f"Question: {question}\n\nLines:\n{numbered}"
+def retrieve_relevant_lines(question: str, lines: list[tuple[int, int, str]], title: str = "", abstract: str = "") -> list[int]:
+    numbered = "\n".join(f"{i}| {line[2]}" for i, line in enumerate(lines))
+    # print(f"\n--- Numbered lines ---\n{numbered}\n")
+    header = ""
+    if title:
+        header += f"Paper title: {title}\n"
+    if abstract:
+        header += f"Abstract: {abstract}\n"
+    if header:
+        header += "\n"
+    user_msg = f"{header}Question: {question}\n\nLines:\n{numbered}"
 
     response = client.chat.completions.create(
-        model=MODEL,
+        model=OPENROUTER_MODEL if USE_OPENROUTER else MODEL,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_msg},
@@ -143,7 +171,7 @@ def process_sample(i: int, sample: dict, total: int) -> dict | None:
         return None
 
     text = "\n\n".join(paragraphs)
-    lines = split_into_lines(text)
+    lines = split_into_sentences(text)
 
     evidence_intervals = []
     for ev in evidence:
@@ -158,12 +186,20 @@ def process_sample(i: int, sample: dict, total: int) -> dict | None:
         print(f"[{i+1}/{total}] Skipping — no evidence located in text")
         return None
 
+    title = sample.get("title", "")
+    abstract = sample.get("abstract", "")
+
     try:
-        selected = retrieve_relevant_lines(question, lines)
+        selected = retrieve_relevant_lines(question, lines, title, abstract)
         retrieved_intervals = [(lines[idx][0], lines[idx][1]) for idx in selected]
     except Exception as e:
         print(f"[{i+1}/{total}] Skipping — retrieval failed ({e})")
         return None
+
+    # print(f"\n--- Output line numbers ---")
+    # for idx in selected:
+    #     print(f"  {idx}| {lines[idx][2]}")
+    # print()
 
     metrics = compute_metrics(retrieved_intervals, evidence_intervals)
     print(
