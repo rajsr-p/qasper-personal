@@ -9,7 +9,7 @@ import json
 from datasets import load_dataset
 
 # ── Constants ────────────────────────────────────────────────────────────────
-SPLIT = "test"
+SPLIT = "train"
 SAMPLE = False   # if True, output only the first valid datapoint
 
 # ── Load ─────────────────────────────────────────────────────────────────────
@@ -41,6 +41,12 @@ for paper in split_data:
             for ev in ans["evidence"]:
                 if ev not in evidence:
                     evidence.append(ev)
+
+        if not evidence:
+            continue
+
+        text = "\n\n".join(paragraphs)
+        evidence = [ev for ev in evidence if text.find(ev.strip()) != -1]
 
         if not evidence:
             continue

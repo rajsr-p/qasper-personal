@@ -196,10 +196,10 @@ def process_sample(i: int, sample: dict, total: int) -> dict | None:
         print(f"[{i+1}/{total}] Skipping — retrieval failed ({e})")
         return None
 
-    # print(f"\n--- Output line numbers ---")
-    # for idx in selected:
-    #     print(f"  {idx}| {lines[idx][2]}")
-    # print()
+    print(f"\n--- Output lines ---")
+    for idx in selected:
+        print(f"  {idx}| {lines[idx][2]}")
+    print()
 
     metrics = compute_metrics(retrieved_intervals, evidence_intervals)
     print(
@@ -210,7 +210,7 @@ def process_sample(i: int, sample: dict, total: int) -> dict | None:
 
 
 def main():
-    with open("qasper-test.json") as f:
+    with open("qasper-sample.json") as f:
         data = json.load(f)
 
     samples = data[SKIP:]

@@ -8,12 +8,12 @@ from rlm import RLM
 
 load_dotenv()
 
-MAX_SAMPLES = None
+MAX_SAMPLES = 1
 SKIP = 0
-BATCH_SIZE = 10
+BATCH_SIZE = 1
 MODEL = "mercury-2"
 USE_OPENROUTER = True
-OPENROUTER_MODEL = "qwen/qwen3.5-27b"
+OPENROUTER_MODEL = "anthropic/claude-opus-4.6"
 
 SYSTEM_PROMPT_TEMPLATE = """\
 You are an evidence retrieval agent. The variable `TEXT` contains a research paper.
@@ -197,7 +197,7 @@ def retrieve_relevant_substrings(question: str, text: str, title: str = "", abst
         environment="local",
         max_depth=1,
         max_iterations=20,
-        verbose=False,
+        verbose=True,
         custom_tools=tools,
         custom_system_prompt=system_prompt,
     )
@@ -341,7 +341,7 @@ def process_sample_remote(i, sample, total):
 def main():
     ray.init(ignore_reinit_error=True)
 
-    with open("qasper-test.json") as f:
+    with open("qasper-sample.json") as f:
         data = json.load(f)
 
     samples = data[SKIP:] if MAX_SAMPLES is None else data[SKIP:SKIP + MAX_SAMPLES]
